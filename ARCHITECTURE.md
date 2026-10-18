@@ -1,99 +1,87 @@
-# ⚡ KiloWatt Application Architecture Specification
+# Architecture
 
-## 📄 Overview
-**KiloWatt** is an AI-powered smart utility meter reading Android application. It captures live camera frames, processes digital and analog electric meter displays using on-device Optical Character Recognition (OCR), extracts meter readings and anomaly fault codes, calculates real-time electricity tariff quotes, and computes rooftop solar energy savings potential.
+KiloWatt India is an Android app (Kotlin, Jetpack Compose) with a small FastAPI ingestion service. The app follows **MVVM** with a **repository** layer. Dependencies point inward: screens depend on ViewModels, ViewModels depend on repositories, and repositories depend on the domain rules and on the data sources. The domain layer depends on nothing Android-specific.
 
----
+## Layers
 
-## 🏗️ Architectural Pattern
-The application follows modern Android Development (MAD) best practices utilizing the **MVVM (Model-View-ViewModel)** architectural pattern with **Unidirectional Data Flow (UDF)**.
+| Layer | Package | Responsibility | Depends on |
+|---|---|---|---|
+| Domain | `domain` | Models, estimates, tariff, geometry, reading merge. Pure Kotlin, unit tested. | Nothing |
+| Data | `data.local`, `data.remote`, `data.repository` | Phone storage, HTTP client, repositories | Domain |
+| Sync | `sync` | WorkManager upload job and scheduler | Data |
+| ML / AR | `ml`, `ar` | TensorFlow Lite meter reader, ARCore renderer | Domain (for geometry) |
+| UI | `ui.*` | Compose screens and ViewModels | Data, Domain, ML, AR |
+| DI | `di`, `KiloWattApplication` | Creates the repositories once | Data |
+
+## Screens and ViewModels
+
+| Screen | ViewModel | Reads from | Actions |
+|---|---|---|---|
+| Launch | (none) | Nothing | Waits 2.4 s, then Home |
+| Home | `HomeViewModel` | `ReadingRepository` (merged readings) | Scan, balcony, open History |
+| Scanner | `ScannerViewModel` | `TfLiteMeterReader` suggestions | Shutter, confirm reading |
+| Reading sheet | `ScannerViewModel` | Suggestion and confirmed state | Yes, Edit / Save, scan again |
+| Balcony AR | `BalconyViewModel` | ARCore renderer state | Save survey |
+| History | `HistoryViewModel` | Readings, surveys, server status | Filter, refresh on open |
+| Telemetry | Uses Home state | Latest reading | Back to Home |
+
+Screens are stateless: they draw the state they are given and send actions back. Navigation is in `AppNavigationViewModel`, and `KiloWattApp` wires the ViewModels to the screens.
+
+## Reading lifecycle
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           PRESENTATION LAYER                                │
-│                                                                             │
-│  [MainActivity]  ──►  [KiloWattApp]  ──►  [CameraView]                      │
-│                                           [ScanningReticleOverlay]          │
-│                                           [ScanResultBottomSheetCard]       │
-└──────────────────────────────────────┬──────────────────────────────────────┘
-                                       │ Observes StateFlow<MeterUiState>
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                             DOMAIN & STATE LAYER                            │
-│                                                                             │
-│  [MeterViewModel]                                                           │
-│  ├── State: StateFlow<MeterUiState>                                         │
-│  ├── Tariff Engine ($0.18 / kWh)                                            │
-│  └── Solar Potential Calculator (Panel Count & Annual Savings)              │
-└──────────────────────────────────────▲──────────────────────────────────────┘
-                                       │ Invokes Callbacks
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         VISION & ANALYSIS LAYER                             │
-│                                                                             │
-│  [CameraX ImageAnalysis]  ──►  [MeterImageAnalyzer]                         │
-│                                ├── Google ML Kit Text Recognition (Latin)   │
-│                                ├── Regex Engine (\b\d{4,6}(\.\d{1,2})?\b)    │
-│                                └── Anomaly Detector (ERR, WARN, FAULT)      │
-└─────────────────────────────────────────────────────────────────────────────┘
+Scanner suggests value ──► user confirms ──► PendingReadingStore (phone, JSON)
+                                                   │
+                       WorkManager (network connected, on launch, every 15 min)
+                                                   ▼
+                              POST /api/v1/readings ──► 201 Created?
+                                                   │         │
+                                                  yes        no → retry with backoff
+                                                   ▼
+                              remove from phone; server copy is the record
 ```
 
----
+Rules:
+- A reading is written to the phone before any upload is attempted.
+- A reading is removed from the phone only after `201 Created`.
+- History shows a reading once: the server copy if it exists, otherwise the phone copy.
+- If the server cannot be reached, History shows only the phone copies and says so.
 
-## 🗂️ Component Directory & Responsibilities
+## Balcony lifecycle
 
-### 1. Presentation Layer (`MainActivity.kt`)
-- **[MainActivity.kt](file:///Users/manojmouryaneeli/Documents/Android%20Projects/kilowatt/app/src/main/java/com/inouiw/kilowatt/MainActivity.kt)**
-  - **`KiloWattApp`**: Root Composable handling runtime camera permission initialization (`ActivityResultContracts.RequestPermission`).
-  - **`CameraView`**: Encapsulates CameraX `PreviewView` using `AndroidView`. Binds camera preview and `ImageAnalysis` pipelines to the activity `LifecycleOwner`.
-  - **`ScanningReticleOverlay`**: Composes the camera HUD reticle using `Canvas` with an animated vertical laser beam (`#00FF88`) and electric corner brackets (`#00E5FF`).
-  - **`TopHeaderBar`**: Displays application identity and live scanning state indicator badges.
-  - **`ScanResultBottomSheetCard`**: Animated Material 3 bottom card presenting verified meter readings, dynamic tariff quotes, solar panel recommendations, and fault alert banners.
-  - **`CameraPermissionRequestScreen`**: Onboarding fallback screen displayed when camera access is denied.
+1. `ArSessionFactory` checks that ARCore is supported and creates a session with horizontal plane detection.
+2. `ArBalconyRenderer` draws the camera image and, on every frame, picks the largest tracked floor plane.
+3. Span and area are kept over the last 60 frames (about two seconds). The survey is only marked stable when both stay within 10%.
+4. "Lock Dimensions & Save" stores the survey on the phone. Surveys are not uploaded yet.
 
-### 2. State Management Layer (`MeterViewModel.kt`)
-- **[MeterViewModel.kt](file:///Users/manojmouryaneeli/Documents/Android%20Projects/kilowatt/app/src/main/java/com/inouiw/kilowatt/MeterViewModel.kt)**
-  - **`MeterUiState`**: Immutable state data class containing:
-    - `hasCameraPermission`: Permission grant status.
-    - `isScanning`: Flag determining active laser scanner state.
-    - `detectedKWh`: Verified double value of electric meter reading.
-    - `instantTariffRate`: Base grid rate ($0.18 / kWh).
-    - `estimatedMonthlyBill`: Monthly bill calculation based on reading.
-    - `solarPanelCount`: Recommended rooftop solar panel count (`monthlyKwh / 35.0`).
-    - `solarAnnualSavings`: Projected yearly clean energy savings ($210/panel).
-    - `hasFault` & `faultMessage`: Meter error code alerts.
-    - `isReadingVerified`: Flag triggering UI bottom card slide-in.
-  - **`onMeterReadingDetected()`**: Business logic processor that updates state upon new valid readings from the analysis layer.
-  - **`resetScan()`**: Resets scan state to allow subsequent meter readings.
+## Domain rules
 
-### 3. Vision Analysis Layer (`MeterImageAnalyzer.kt`)
-- **[MeterImageAnalyzer.kt](file:///Users/manojmouryaneeli/Documents/Android%20Projects/kilowatt/app/src/main/java/com/inouiw/kilowatt/MeterImageAnalyzer.kt)**
-  - Implements CameraX `ImageAnalysis.Analyzer`.
-  - Processes frames asynchronously via Google ML Kit `TextRecognition.getClient(...)`.
-  - Parses meter kWh numbers using regex `\b\d{4,6}(\.\d{1,2})?\b`.
-  - Detects anomaly keywords (`ERR`, `WARN`, `FAULT`).
-  - Safely closes `ImageProxy` frames via `addOnCompleteListener` to prevent memory leaks and frame buffer deadlocks.
+| Rule | Where | Test |
+|---|---|---|
+| Energy charge by slab (first 100 units only) | `TariffSchedule` | `TariffScheduleTest` |
+| Panels that fit: 60% of area ÷ 2.6 m² | `Estimates.panelsFor` | `EstimatesTest` |
+| Yearly generation: panels × 0.55 kW × 1300 kWh/kWp | `Estimates.yearlyGenerationKwh` | `EstimatesTest` |
+| Monthly usage from two readings at least a day apart | `Estimates.monthlyUsageKwh` | `EstimatesTest` |
+| Merge phone and server readings without duplicates | `mergeReadings` | `ReadingMergeTest` |
+| Polygon area and steady measurement | `Geometry` | `GeometryTest` |
 
----
+## Server
 
-## 🛠️ Technology Stack & Dependencies
+`backend/main.py` is a FastAPI service backed by SQLite.
 
-| Category | Technology / Dependency | Version | Purpose |
-| :--- | :--- | :--- | :--- |
-| **Language** | Kotlin | `2.0.21` | Modern idiomatic Kotlin development |
-| **UI Framework** | Jetpack Compose + Material 3 | BOM `2024.09.00` | Declarative UI and adaptive components |
-| **Camera Hardware** | CameraX | `1.4.0` | Camera lifecycle management and frame analysis |
-| **ML / OCR** | Google ML Kit Text Recognition | `16.0.1` | On-device text recognition |
-| **Architecture** | ViewModel Compose | `2.8.6` | Lifecycle-aware UI state holder |
-| **Target SDK** | Android SDK | `37` (Compile) / `35` (Target) | Android platform APIs |
+- `POST /api/v1/readings` inserts or replaces a reading by id and returns `201 Created`.
+- `GET /api/v1/readings` returns readings, newest captured first.
+- The server stores kWh only. Tariff and bill calculations stay in the app.
 
----
+## Configuration
 
-## 🔐 Security & Permissions
+- `INGESTION_BASE_URL` is set in `app/build.gradle.kts` (`buildConfigField`).
+- The ARCore dependency is `com.google.ar:core`. The manifest marks ARCore as optional, so the app still runs without it.
 
-1. **Permissions:**
-   - `android.permission.CAMERA`: Required for camera feed scanning.
-   - `android.permission.INTERNET`: Declared for network access.
-2. **Hardware Features:**
-   - `<uses-feature android:name="android.hardware.camera" android:required="true" />`
-3. **On-Device Privacy:**
-   - Optical character recognition runs **100% on-device** using ML Kit local binaries. Camera frames are analyzed in memory and immediately disposed of. No camera video streams or images leave the local runtime environment.
+## Known gaps
+
+- No authentication on the ingestion API.
+- The TensorFlow digit model has not been measured for accuracy on real meters.
+- Native libraries from TensorFlow Lite and ARCore are not all 16 KB page-aligned, which shows a warning on Android 15+.
+- Balcony surveys are not uploaded.
+- Telemetry shows only the latest reading and its status.

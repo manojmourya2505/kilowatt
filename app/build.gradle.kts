@@ -15,6 +15,9 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Ingestion server on the Mac, same Wi-Fi as the phone. Change this when the server moves.
+        buildConfigField("String", "INGESTION_BASE_URL", "\"http://192.168.29.213:8000\"")
     }
 
     androidResources {
@@ -34,6 +37,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
